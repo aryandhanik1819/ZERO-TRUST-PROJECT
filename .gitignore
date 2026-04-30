@@ -1,22 +1,19 @@
-# Byte-compiled / optimized / DLL files
+# Node
+node_modules/
+frontend/node_modules/
+
+# Python
 __pycache__/
-*.py[cod]
-*$py.class
+*.pyc
 
-# Virtual Environments
-venv/
-env/
-ENV/
-env.bak/
-venv.bak/
-
-# SQLite databases
-*.sqlite
+# Database
 *.db
 
-# Data directory (used for local audit logs or local database)
-data/
+# Env
+.env
 
-# IDEs
-.idea/
-.vscode/
+# Logs
+*.log
+
+# Build
+dist/
