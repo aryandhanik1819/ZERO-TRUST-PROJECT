@@ -20,7 +20,9 @@
 #    - EDR (Endpoint Detection & Response): CrowdStrike, SentinelOne
 #    - The device agent reporting its own health
 #
-#  For this project, we simulate a device registry in memory.
+#  PERSISTENCE:
+#  Devices are stored in SQLite via SQLAlchemy.
+#  Demo devices are seeded only if the table is empty.
 # ============================================================
 
 import uuid
@@ -28,6 +30,9 @@ from datetime import datetime, timezone, timedelta
 from dataclasses import dataclass, field
 from typing import Optional, Dict
 from enum import Enum
+
+from database import SessionLocal
+from models import DeviceModel
 
 
 class DeviceTrustLevel(str, Enum):
@@ -57,7 +62,7 @@ class DeviceOS(str, Enum):
 @dataclass
 class DeviceProfile:
     """
-    A registered device's profile in our system.
+    A registered device's profile in our system (DTO).
 
     device_id:       Unique ID we assign
     fingerprint:     Hardware/browser fingerprint (unique device identifier)
@@ -107,6 +112,28 @@ class PostureReport:
     timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
+# ── Helper: Convert ORM model ↔ DTO ──────────────────────────
+
+def _profile_from_model(m: DeviceModel) -> DeviceProfile:
+    """Convert a SQLAlchemy DeviceModel row to a DeviceProfile dataclass."""
+    return DeviceProfile(
+        device_id=m.device_id,
+        fingerprint=m.fingerprint,
+        owner_user_id=m.owner_user_id,
+        os_type=DeviceOS(m.os_type) if m.os_type in [e.value for e in DeviceOS] else DeviceOS.UNKNOWN,
+        os_version=m.os_version,
+        is_managed=m.is_managed,
+        last_patch_date=m.last_patch_date,
+        is_encrypted=m.is_encrypted,
+        has_antivirus=m.has_antivirus,
+        is_jailbroken=m.is_jailbroken,
+        compliance_score=m.compliance_score,
+        trust_level=DeviceTrustLevel(m.trust_level) if m.trust_level in [e.value for e in DeviceTrustLevel] else DeviceTrustLevel.UNTRUSTED,
+        last_seen=m.last_seen,
+        registered_at=m.registered_at,
+    )
+
+
 class DeviceTrustEngine:
     """
     Manages device registration, posture checking, and trust scoring.
@@ -128,12 +155,18 @@ class DeviceTrustEngine:
     """
 
     def __init__(self):
-        # In-memory device registry — use a DB in production
-        self._devices: Dict[str, DeviceProfile] = {}  # fingerprint → DeviceProfile
         self._seed_demo_devices()
 
     def _seed_demo_devices(self):
-        """Pre-register some demo devices for testing."""
+        """Pre-register some demo devices — only if table is empty."""
+        db = SessionLocal()
+        try:
+            existing = db.query(DeviceModel).first()
+            if existing is not None:
+                return  # Already seeded
+        finally:
+            db.close()
+
         # Alice's trusted managed laptop
         self.register_device(
             fingerprint="alice-laptop-001",
@@ -175,8 +208,11 @@ class DeviceTrustEngine:
         Register a new device in the system.
         Immediately runs posture assessment to compute trust level.
         """
+        device_id = str(uuid.uuid4())
+
+        # Build a temporary DTO for posture assessment
         device = DeviceProfile(
-            device_id=str(uuid.uuid4()),
+            device_id=device_id,
             fingerprint=fingerprint,
             owner_user_id=owner_user_id,
             os_type=os_type,
@@ -185,7 +221,7 @@ class DeviceTrustEngine:
             last_patch_date=last_patch_date,
             is_encrypted=is_encrypted,
             has_antivirus=has_antivirus,
-            is_jailbroken=is_jailbroken
+            is_jailbroken=is_jailbroken,
         )
 
         # Run posture assessment immediately on registration
@@ -193,15 +229,66 @@ class DeviceTrustEngine:
         device.compliance_score = report.compliance_score
         device.trust_level = report.trust_level
 
-        self._devices[fingerprint] = device
+        # Persist to database (upsert — update if fingerprint already exists)
+        db = SessionLocal()
+        try:
+            existing = db.query(DeviceModel).filter(DeviceModel.fingerprint == fingerprint).first()
+            if existing:
+                # Update existing device record
+                existing.owner_user_id = owner_user_id
+                existing.os_type = os_type.value if isinstance(os_type, DeviceOS) else os_type
+                existing.os_version = os_version
+                existing.is_managed = is_managed
+                existing.last_patch_date = last_patch_date
+                existing.is_encrypted = is_encrypted
+                existing.has_antivirus = has_antivirus
+                existing.is_jailbroken = is_jailbroken
+                existing.compliance_score = device.compliance_score
+                existing.trust_level = device.trust_level.value if isinstance(device.trust_level, DeviceTrustLevel) else device.trust_level
+                device.device_id = existing.device_id  # Keep the original ID
+            else:
+                db_device = DeviceModel(
+                    device_id=device_id,
+                    fingerprint=fingerprint,
+                    owner_user_id=owner_user_id,
+                    os_type=os_type.value if isinstance(os_type, DeviceOS) else os_type,
+                    os_version=os_version,
+                    is_managed=is_managed,
+                    last_patch_date=last_patch_date,
+                    is_encrypted=is_encrypted,
+                    has_antivirus=has_antivirus,
+                    is_jailbroken=is_jailbroken,
+                    compliance_score=device.compliance_score,
+                    trust_level=device.trust_level.value if isinstance(device.trust_level, DeviceTrustLevel) else device.trust_level,
+                )
+                db.add(db_device)
+            db.commit()
+        finally:
+            db.close()
+
         return device
 
     def get_device(self, fingerprint: str) -> Optional[DeviceProfile]:
         """Look up a device by its fingerprint."""
-        device = self._devices.get(fingerprint)
-        if device:
-            device.last_seen = datetime.now(timezone.utc).isoformat()
-        return device
+        db = SessionLocal()
+        try:
+            db_device = db.query(DeviceModel).filter(DeviceModel.fingerprint == fingerprint).first()
+            if not db_device:
+                return None
+            db_device.last_seen = datetime.now(timezone.utc).isoformat()
+            db.commit()
+            return _profile_from_model(db_device)
+        finally:
+            db.close()
+
+    def get_all_devices(self, limit: int = 50) -> list[DeviceProfile]:
+        """Get a list of all registered devices for the dashboard."""
+        db = SessionLocal()
+        try:
+            devices = db.query(DeviceModel).order_by(DeviceModel.last_seen.desc()).limit(limit).all()
+            return [_profile_from_model(d) for d in devices]
+        finally:
+            db.close()
 
     def assess_posture(self, device: DeviceProfile) -> PostureReport:
         """

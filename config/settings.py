@@ -78,6 +78,9 @@ class AppConfig:
     jwt: JWTConfig = field(default_factory=JWTConfig)
     policy: PolicyThresholds = field(default_factory=PolicyThresholds)
 
+    # Database
+    database_url: str = os.getenv("DATABASE_URL", "sqlite:///data/zerotrust.db")
+
     audit_log_path: str = "audit/audit.log"
     max_sessions_per_user: int = 3
     session_timeout_minutes: int = 60

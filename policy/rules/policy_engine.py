@@ -112,7 +112,9 @@ class PolicyEngine:
         self,
         assessment: RiskAssessment,
         user_id: str = "",
-        resource: str = ""
+        resource: str = "",
+        resource_tags: List[str] = None,
+        device_is_managed: bool = False
     ) -> PolicyResult:
         """
         Core evaluation method.
@@ -123,6 +125,8 @@ class PolicyEngine:
             assessment: Output from RiskScorer.compute_risk()
             user_id:    The user making the request (for logging)
             resource:   What resource they're trying to access
+            resource_tags: Tags on the resource (e.g., ["Confidential"])
+            device_is_managed: Whether the device is corporate-managed
         """
         score = assessment.final_score
 
@@ -144,6 +148,15 @@ class PolicyEngine:
 
         else:
             result = self._deny(score, assessment.risk_level)
+
+        # ── Secondary Gate: Attribute-Based Access Control (ABAC) ──
+        # Even if the risk score is low, strict rules apply to sensitive data
+        if resource_tags and "Confidential" in resource_tags:
+            if not device_is_managed:
+                # Override the risk-based decision to DENY
+                result = self._deny(score, assessment.risk_level)
+                result.message = "ABAC Block: Confidential resources require a managed device."
+                result.required_actions.append("abac_policy_violation")
 
         # Attach metadata for audit trail
         result.user_id = user_id

@@ -43,6 +43,10 @@ from device.device_trust import DeviceTrustEngine, DeviceOS, DeviceTrustLevel
 from monitoring.session_monitor import SessionMonitor
 from audit.audit_logger import AuditLogger, AuditEvent
 
+# Initialize database tables before any tests run
+from database import init_db
+init_db()
+
 
 # ══════════════════════════════════════════════════════════════
 #  CONFIG TESTS
@@ -226,7 +230,7 @@ class TestPolicyEngine(unittest.TestCase):
 
     def _make_assessment_with_score(self, target_score: float):
         """Helper: create an assessment approximately hitting a target score."""
-        from policy.risk_scorer import RiskAssessment
+        from policy.rules.risk_scorer import RiskAssessment
         return RiskAssessment(
             identity_score=target_score,
             device_score=target_score,
@@ -391,16 +395,20 @@ class TestAuthService(unittest.TestCase):
 
     def test_register_and_login_new_user(self):
         """Register a new user, then verify they can log in."""
-        reg = self.auth.register("newuser", "new@test.com", "NewUser@123")
+        import uuid
+        unique_name = f"newuser_{uuid.uuid4().hex[:8]}"
+        reg = self.auth.register(unique_name, f"{unique_name}@test.com", "NewUser@123")
         self.assertTrue(reg["success"])
 
-        login = self.auth.login("newuser", "NewUser@123")
+        login = self.auth.login(unique_name, "NewUser@123")
         self.assertTrue(login.success)
 
     def test_duplicate_registration_fails(self):
         """Registering the same username twice should fail."""
-        self.auth.register("dupuser", "dup@test.com", "Dup@12345")
-        result = self.auth.register("dupuser", "dup2@test.com", "Dup@12345")
+        import uuid
+        dup_name = f"dupuser_{uuid.uuid4().hex[:8]}"
+        self.auth.register(dup_name, "dup@test.com", "Dup@12345")
+        result = self.auth.register(dup_name, "dup2@test.com", "Dup@12345")
         self.assertFalse(result["success"])
 
     def test_verify_valid_token(self):
@@ -430,11 +438,13 @@ class TestAuthService(unittest.TestCase):
 
     def test_account_lockout_after_5_failures(self):
         """Account should lock after 5 failed login attempts."""
-        self.auth.register("locktest", "lock@test.com", "Lock@123")
+        import uuid
+        lock_name = f"locktest_{uuid.uuid4().hex[:8]}"
+        self.auth.register(lock_name, f"{lock_name}@test.com", "Lock@123")
         for _ in range(5):
-            self.auth.login("locktest", "wrongpassword")
+            self.auth.login(lock_name, "wrongpassword")
 
-        result = self.auth.login("locktest", "Lock@123")  # Correct password
+        result = self.auth.login(lock_name, "Lock@123")  # Correct password
         self.assertFalse(result.success)
         self.assertIn("locked", result.message.lower())
 
@@ -630,12 +640,12 @@ class TestFullPipeline(unittest.TestCase):
 
     def test_audit_log_records_decisions(self):
         """Every decision should appear in the audit log."""
-        initial_count = len(self.logger._in_memory_log)
+        initial_count = self.logger.get_event_count()
         self._run_pipeline(
             IdentityRiskFactors(), DeviceRiskFactors(),
             BehaviorRiskFactors(), ContextRiskFactors()
         )
-        self.assertEqual(len(self.logger._in_memory_log), initial_count + 1)
+        self.assertEqual(self.logger.get_event_count(), initial_count + 1)
 
     def test_login_then_verify_token(self):
         """Login → get token → verify token → check user identity."""

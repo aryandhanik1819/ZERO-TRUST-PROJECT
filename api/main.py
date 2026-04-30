@@ -40,6 +40,7 @@ from typing import Optional
 import time
 
 from config.settings import config
+from database import init_db
 from identity.auth_services import AuthService
 from policy.rules.risk_scorer import (
     RiskScorer,
@@ -86,8 +87,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ── Database Initialization ───────────────────────────────────
+# Create all tables on startup (idempotent — safe to call every time)
+init_db()
+
 # ── Module Instances ──────────────────────────────────────────
 # Each module is instantiated once and shared across all requests
+# NOTE: AuthService and DeviceTrustEngine now seed demo data into
+#       the database if it's empty (idempotent seeding).
 auth_service = AuthService()
 risk_scorer = RiskScorer()
 policy_engine = PolicyEngine()
@@ -137,6 +144,9 @@ class AccessCheckRequest(BaseModel):
     ip_reputation_score: float = Field(default=0.0, example=0.0, ge=0, le=100)
     vpn_or_proxy: bool = Field(default=False, example=False)
     geolocation_anomaly: bool = Field(default=False, example=False)
+
+    # ABAC Tags
+    resource_tags: list[str] = Field(default_factory=list, example=["Confidential"])
 
 
 # ── Authentication Helper ─────────────────────────────────────
@@ -365,7 +375,9 @@ async def check_access(
     policy_result = policy_engine.evaluate(
         assessment=assessment,
         user_id=current_user.user_id,
-        resource=body.resource
+        resource=body.resource,
+        resource_tags=body.resource_tags,
+        device_is_managed=body.is_managed_device
     )
 
     # ── Step 5: Track in session monitor ─────────────────────
@@ -469,6 +481,7 @@ async def simulate_scenarios():
     ]
 
     results = []
+    import uuid
     for scenario in scenarios:
         assessment = risk_scorer.compute_risk(
             identity=scenario["identity"],
@@ -476,7 +489,27 @@ async def simulate_scenarios():
             behavior=scenario["behavior"],
             context=scenario["context"]
         )
-        policy_result = policy_engine.evaluate(assessment)
+        policy_result = policy_engine.evaluate(
+            assessment=assessment,
+            device_is_managed=scenario["device"].is_managed
+        )
+
+        # Log to the database so it appears on the live dashboard
+        fake_user = f"demo_user_{uuid.uuid4().hex[:4]}"
+        audit_logger.log_access_request(
+            user_id=fake_user,
+            username=fake_user,
+            resource="/api/demo-resource",
+            action="GET",
+            risk_score=assessment.final_score,
+            risk_level=assessment.risk_level,
+            policy_decision=policy_result.decision.value,
+            access_level=policy_result.access_level.value,
+            ip_address="192.168.1.100" if scenario["context"].ip_reputation_score < 50 else "203.0.113.50",
+            device_fingerprint=f"demo_device_{uuid.uuid4().hex[:4]}",
+            session_id=f"demo_session_{uuid.uuid4().hex[:4]}",
+            risk_factors=assessment.explanation
+        )
 
         results.append({
             "scenario": scenario["name"],
@@ -542,3 +575,26 @@ async def get_my_session(current_user=Depends(get_current_user)):
     """Get your own session activity summary."""
     summary = session_monitor.get_session_summary(current_user.session_id)
     return summary or {"message": "No session data found"}
+
+
+# ── Dashboard & Analytics Routes (College Project Phase 2) ────
+
+@app.get("/stats/overview", tags=["Dashboard"])
+async def get_dashboard_stats():
+    """
+    Returns aggregated metrics for the frontend overview dashboard.
+    Shows the total allowed/denied requests and average risk score.
+    """
+    # In a real app this might require admin auth, but we leave it open for demo ease
+    return audit_logger.get_dashboard_stats()
+
+
+@app.get("/devices", tags=["Dashboard"])
+async def get_all_devices():
+    """Returns a list of all registered devices and their posture scores."""
+    from dataclasses import asdict
+    devices = device_engine.get_all_devices(limit=100)
+    return {
+        "devices": [asdict(d) for d in devices],
+        "count": len(devices)
+    }

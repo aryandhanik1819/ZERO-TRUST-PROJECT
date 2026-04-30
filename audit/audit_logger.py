@@ -25,6 +25,10 @@
 #  Every access request (allowed AND denied), every authentication
 #  event, every policy decision, every anomaly.
 #  "Log everything, store securely, review regularly."
+#
+#  PERSISTENCE:
+#  Events are stored in SQLite via SQLAlchemy AND written to a
+#  JSONL file for backward compatibility and SIEM export.
 # ============================================================
 
 import json
@@ -34,6 +38,8 @@ from datetime import datetime, timezone
 from dataclasses import dataclass, asdict, field
 from typing import Optional
 from config.settings import config
+from database import SessionLocal
+from models import AuditEventModel
 
 
 @dataclass
@@ -75,12 +81,16 @@ class AuditEvent:
 
 class AuditLogger:
     """
-    Writes audit events to a structured log file and in-memory store.
+    Writes audit events to the database AND a structured log file.
 
     FORMAT:
     Each log entry is one JSON object per line (JSONL format).
     This is standard in security logging — easy to parse, stream,
     and ingest into SIEM tools.
+
+    DUAL STORAGE:
+    - SQLite database: for fast queries (recent events, user events, etc.)
+    - JSONL file: for backward compatibility and SIEM export
 
     IN PRODUCTION:
     - Send to SIEM (Splunk, Elastic/ELK, Azure Sentinel)
@@ -93,7 +103,6 @@ class AuditLogger:
     def __init__(self):
         self.log_path = config.audit_log_path
         self._ensure_log_directory()
-        self._in_memory_log = []    # Also keep in memory for quick queries
 
     def _ensure_log_directory(self):
         """Create the audit directory if it doesn't exist."""
@@ -101,7 +110,7 @@ class AuditLogger:
 
     def log(self, event: AuditEvent):
         """
-        Write an audit event to log file and in-memory store.
+        Write an audit event to database and log file.
 
         We use JSONL (one JSON per line) for the file format.
         This makes it easy to:
@@ -109,15 +118,43 @@ class AuditLogger:
         - Parse line by line for analysis
         - Stream to external systems
         """
-        self._in_memory_log.append(event)
+        # Write to database
+        db = SessionLocal()
+        try:
+            db_event = AuditEventModel(
+                event_id=event.event_id,
+                event_type=event.event_type,
+                timestamp=event.timestamp,
+                user_id=event.user_id,
+                username=event.username,
+                session_id=event.session_id,
+                resource=event.resource,
+                action=event.action,
+                ip_address=event.ip_address,
+                device_fingerprint=event.device_fingerprint,
+                location=event.location,
+                risk_score=event.risk_score,
+                risk_level=event.risk_level,
+                policy_decision=event.policy_decision,
+                access_level=event.access_level,
+                details=event.details,
+                risk_factors=event.risk_factors,
+            )
+            db.add(db_event)
+            db.commit()
+        except Exception as e:
+            db.rollback()
+            print(f"[AUDIT WARNING] Failed to write audit event to DB: {e}")
+        finally:
+            db.close()
 
-        # Write to file
+        # Also write to JSONL file for backward compatibility
         try:
             with open(self.log_path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(asdict(event)) + "\n")
         except Exception as e:
             # Logging errors should never crash the application
-            print(f"[AUDIT WARNING] Failed to write audit log: {e}")
+            print(f"[AUDIT WARNING] Failed to write audit log file: {e}")
 
     def log_access_request(
         self,
@@ -175,23 +212,108 @@ class AuditLogger:
         self.log(event)
 
     def get_recent_events(self, limit: int = 50) -> list:
-        """Get the most recent audit events from memory."""
-        return [
-            {k: v for k, v in vars(e).items()} if hasattr(e, '__dict__')
-            else e.__dict__ if hasattr(e, '__dict__')
-            else vars(e)
-            for e in self._in_memory_log[-limit:]
-        ]
+        """Get the most recent audit events from database."""
+        db = SessionLocal()
+        try:
+            rows = db.query(AuditEventModel).order_by(
+                AuditEventModel.timestamp.desc()
+            ).limit(limit).all()
+            return [self._row_to_dict(r) for r in rows]
+        finally:
+            db.close()
 
     def get_events_for_user(self, user_id: str, limit: int = 20) -> list:
         """Get audit events for a specific user."""
-        user_events = [e for e in self._in_memory_log if e.user_id == user_id]
-        return user_events[-limit:]
+        db = SessionLocal()
+        try:
+            rows = db.query(AuditEventModel).filter(
+                AuditEventModel.user_id == user_id
+            ).order_by(
+                AuditEventModel.timestamp.desc()
+            ).limit(limit).all()
+            return [self._row_to_dict(r) for r in rows]
+        finally:
+            db.close()
 
     def get_denied_requests(self, limit: int = 20) -> list:
         """Get recently denied access requests — useful for security monitoring."""
-        denied = [e for e in self._in_memory_log if e.policy_decision == "DENY"]
-        return denied[-limit:]
+        db = SessionLocal()
+        try:
+            rows = db.query(AuditEventModel).filter(
+                AuditEventModel.policy_decision == "DENY"
+            ).order_by(
+                AuditEventModel.timestamp.desc()
+            ).limit(limit).all()
+            return [self._row_to_dict(r) for r in rows]
+        finally:
+            db.close()
+
+    def get_event_count(self) -> int:
+        """Get total number of audit events in the database."""
+        db = SessionLocal()
+        try:
+            return db.query(AuditEventModel).count()
+        finally:
+            db.close()
+
+    def get_dashboard_stats(self) -> dict:
+        """Aggregates metrics for the frontend dashboard overview."""
+        from sqlalchemy import func
+        db = SessionLocal()
+        try:
+            total_requests = db.query(AuditEventModel).filter(AuditEventModel.event_type == "ACCESS_REQUEST").count()
+            
+            # Group by policy decision
+            decision_counts = db.query(
+                AuditEventModel.policy_decision, 
+                func.count(AuditEventModel.event_id)
+            ).filter(
+                AuditEventModel.event_type == "ACCESS_REQUEST"
+            ).group_by(AuditEventModel.policy_decision).all()
+            
+            allowed = sum(count for decision, count in decision_counts if decision in ["ALLOW", "ALLOW_WITH_MONITORING"])
+            denied = sum(count for decision, count in decision_counts if decision == "DENY")
+            step_up = sum(count for decision, count in decision_counts if decision == "STEP_UP_AUTH")
+            restrict = sum(count for decision, count in decision_counts if decision == "RESTRICT")
+            
+            # Average risk score
+            avg_risk = db.query(func.avg(AuditEventModel.risk_score)).filter(
+                AuditEventModel.event_type == "ACCESS_REQUEST"
+            ).scalar() or 0.0
+
+            return {
+                "total_requests": total_requests,
+                "allowed": allowed,
+                "denied": denied,
+                "step_up": step_up,
+                "restrict": restrict,
+                "avg_risk_score": round(avg_risk, 1)
+            }
+        finally:
+            db.close()
+
+    @staticmethod
+    def _row_to_dict(row: AuditEventModel) -> dict:
+        """Convert an ORM row to a plain dictionary."""
+        return {
+            "event_id": row.event_id,
+            "event_type": row.event_type,
+            "timestamp": row.timestamp,
+            "user_id": row.user_id,
+            "username": row.username,
+            "session_id": row.session_id,
+            "resource": row.resource,
+            "action": row.action,
+            "ip_address": row.ip_address,
+            "device_fingerprint": row.device_fingerprint,
+            "location": row.location,
+            "risk_score": row.risk_score,
+            "risk_level": row.risk_level,
+            "policy_decision": row.policy_decision,
+            "access_level": row.access_level,
+            "details": row.details or {},
+            "risk_factors": row.risk_factors or [],
+        }
 
 
 # Global audit logger instance — used across the whole application
